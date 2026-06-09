@@ -1,0 +1,18 @@
+[Unit]
+Description=Claude News Aggregator
+After=network.target
+
+[Service]
+Type=simple
+User=claude-news
+Group=claude-news
+WorkingDirectory=/opt/claude-news
+Environment="PATH=/opt/claude-news/venv/bin"
+Environment="NEWS_DB_PATH=/var/lib/claude-news/db.sqlite"
+EnvironmentFile=/etc/claude-news/env
+ExecStart=/opt/claude-news/venv/bin/uvicorn main:app --host 127.0.0.1 --port 18327
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
