@@ -1,5 +1,14 @@
 """
 RSS/Atom feed fetching and normalization.
+
+Design:
+- Each feed is fetched once per refresh cycle (URLs are de-duped via
+  feeds.unique_feed_urls). Items are then fanned out to every category the URL
+  is tagged with, so a feed that lives in both finance_daily and fintech_banking
+  produces two rows per article.
+- Single broken feed must never break the refresh loop — every fetch is wrapped
+  in try/except and the error is persisted to feed_status.
+- All timestamps are normalized to ISO 8601 UTC.
 """
 
 import hashlib
@@ -8,6 +17,7 @@ import re
 import socket
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from urllib.parse import urlparse, parse_qs
 
 import feedparser
 from dateutil import parser as dateparser
@@ -17,6 +27,12 @@ from feeds import unique_feed_urls, categories_for_url
 log = logging.getLogger("feed_fetcher")
 
 USER_AGENT = "ClaudeNewsAggregator/1.0 (+sslip.io)"
+
+# Normal feed items get a 2000-char summary cap. YouTube items go up to 8000
+# so we can fit the transcript head (podcasts are long, headline alone is
+# useless for the digest agent).
+SUMMARY_CAP_DEFAULT = 2000
+SUMMARY_CAP_YOUTUBE = 8000
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _WHITESPACE_RE = re.compile(r"\s+")
@@ -29,7 +45,54 @@ def _strip_html(text):
     return _WHITESPACE_RE.sub(" ", no_tags).strip()
 
 
+def _extract_youtube_video_id(url):
+    """Return the 11-char video id from any common YouTube URL, or None."""
+    try:
+        p = urlparse(url)
+        host = p.netloc.lower()
+        if host.endswith("youtu.be"):
+            return p.path.lstrip("/") or None
+        if "youtube.com" in host:
+            if p.path == "/watch":
+                v = parse_qs(p.query).get("v", [None])[0]
+                return v
+            for prefix in ("/embed/", "/shorts/", "/live/"):
+                if p.path.startswith(prefix):
+                    return p.path[len(prefix):].split("/", 1)[0]
+    except Exception:
+        pass
+    return None
+
+
+def _fetch_youtube_transcript(video_id):
+    """
+    Best-effort fetch of an auto-generated transcript. Tries Russian, Kazakh,
+    English (in that order). Returns plain text or None. Imports lazily so the
+    module loads even if the optional dep is missing.
+    """
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi
+    except Exception as e:
+        log.debug("youtube-transcript-api not installed: %s", e)
+        return None
+    for langs in (["ru"], ["kk"], ["en"], ["ru", "kk", "en"]):
+        try:
+            entries = YouTubeTranscriptApi.get_transcript(video_id, languages=langs)
+            text = " ".join(e["text"] for e in entries if e.get("text"))
+            text = _WHITESPACE_RE.sub(" ", text).strip()
+            if text:
+                return text
+        except Exception:
+            continue
+    log.debug("no transcript available for %s", video_id)
+    return None
+
+
 def _to_utc_iso(value):
+    """
+    Best-effort parse of a feed date into ISO 8601 UTC.
+    Accepts time.struct_time, datetime, RFC 822 string, ISO string.
+    """
     if value is None:
         return None
     try:
@@ -41,16 +104,45 @@ def _to_utc_iso(value):
                 value = value.replace(tzinfo=timezone.utc)
             return value.astimezone(timezone.utc).isoformat()
         if isinstance(value, str):
+            # Some feeds wrap the date in whitespace, e.g.
+            # "<pubDate> Tue, 16 Jun 2026 18:38:20 +0500 </pubDate>".
+            s = value.strip()
+            if not s:
+                return None
             try:
-                dt = parsedate_to_datetime(value)
+                dt = parsedate_to_datetime(s)
             except (TypeError, ValueError):
-                dt = dateparser.parse(value)
+                dt = dateparser.parse(s)
+            if dt is None:
+                return None
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
             return dt.astimezone(timezone.utc).isoformat()
     except Exception as e:
         log.debug("date parse failed for %r: %s", value, e)
     return None
+
+
+# Match a YYYY-MM-DD or YYYY/MM/DD path segment — many KZ/RU sites embed the
+# publish date in the URL when the feed itself omits pubDate.
+_URL_DATE_RE = re.compile(r"/(20\d{2})[-/](\d{1,2})[-/](\d{1,2})(?:/|$)")
+
+
+def _date_from_url(url):
+    """Pull a publication date out of the URL path, or None if not present."""
+    if not url:
+        return None
+    m = _URL_DATE_RE.search(url)
+    if not m:
+        return None
+    try:
+        y, mo, d = (int(x) for x in m.groups())
+        if not (1 <= mo <= 12 and 1 <= d <= 31):
+            return None
+        dt = datetime(y, mo, d, 12, 0, 0, tzinfo=timezone.utc)
+        return dt.isoformat()
+    except Exception:
+        return None
 
 
 def fetch_feed(url, timeout=15):
@@ -68,25 +160,46 @@ def fetch_feed(url, timeout=15):
     if parsed.bozo and isinstance(parsed.bozo_exception, (OSError, socket.error)):
         raise parsed.bozo_exception
 
+    is_youtube_feed = "youtube.com/feeds/videos.xml" in url
+
     items = []
     for entry in parsed.entries:
         link = (entry.get("link") or "").strip()
         title = (entry.get("title") or "").strip()
         if not link or not title:
             continue
+
+        # Prefer published_parsed, then updated_parsed, then string forms.
+        # Last resort: try to extract YYYY-MM-DD from the article URL.
         pub_date = (
             _to_utc_iso(entry.get("published_parsed"))
             or _to_utc_iso(entry.get("updated_parsed"))
             or _to_utc_iso(entry.get("published"))
             or _to_utc_iso(entry.get("updated"))
+            or _date_from_url(link)
         )
+
         summary_raw = entry.get("summary") or entry.get("description") or ""
         if not summary_raw and entry.get("content"):
             try:
                 summary_raw = entry["content"][0].get("value", "")
             except (IndexError, AttributeError):
                 summary_raw = ""
-        summary = _strip_html(summary_raw)[:2000]
+        if is_youtube_feed and not summary_raw:
+            md = entry.get("media_description") or entry.get("yt_description")
+            if md:
+                summary_raw = md
+        summary = _strip_html(summary_raw)[:SUMMARY_CAP_DEFAULT]
+
+        if is_youtube_feed:
+            video_id = _extract_youtube_video_id(link)
+            if video_id:
+                transcript = _fetch_youtube_transcript(video_id)
+                if transcript:
+                    head = (summary + "\n\n").strip() if summary else ""
+                    combined = f"{head}--- TRANSCRIPT ---\n{transcript}"
+                    summary = combined[:SUMMARY_CAP_YOUTUBE]
+
         items.append({
             "link": link,
             "title": title,
@@ -152,3 +265,4 @@ def refresh_all_feeds(db):
         "feeds_error": feeds_error,
         "items_inserted": items_inserted,
     }
+
