@@ -63,6 +63,11 @@ class DB:
     def insert_items(self, items):
         if not items:
             return 0
+        # Note: pub_date is intentionally NOT updated on conflict — the
+        # original publication date should not drift on subsequent refreshes.
+        # Otherwise feeds that omit pub_date (we previously fell back to
+        # fetched_at) would keep getting bumped to "now" every 20 minutes,
+        # making week-old articles permanently rank as fresh.
         sql = """
             INSERT INTO items
               (id, title, link, summary, source_domain, source_category, pub_date, fetched_at)
@@ -70,8 +75,7 @@ class DB:
               (:id, :title, :link, :summary, :source_domain, :source_category, :pub_date, :fetched_at)
             ON CONFLICT(id) DO UPDATE SET
               title=excluded.title,
-              summary=excluded.summary,
-              pub_date=excluded.pub_date
+              summary=excluded.summary
         """
         with self._write_lock, self._conn() as c:
             before = c.execute("SELECT COUNT(*) FROM items").fetchone()[0]
@@ -137,6 +141,38 @@ class DB:
                 "error": error,
                 "items": items_count,
             })
+
+    def repair_pub_dates_from_link(self):
+        """
+        One-shot migration: for items whose pub_date equals fetched_at (i.e.
+        we never had a real publication date and fell back to "now"), try to
+        recover the actual date from the URL path (matches /YYYY-MM-DD/).
+        Returns the number of rows updated.
+        """
+        import re as _re
+        url_date_re = _re.compile(r"/(20\d{2})[-/](\d{1,2})[-/](\d{1,2})(?:/|$)")
+        fixed = 0
+        with self._write_lock, self._conn() as c:
+            rows = c.execute(
+                "SELECT id, link, pub_date, fetched_at FROM items WHERE pub_date = fetched_at"
+            ).fetchall()
+            for r in rows:
+                m = url_date_re.search(r["link"] or "")
+                if not m:
+                    continue
+                try:
+                    y, mo, d = (int(x) for x in m.groups())
+                    if not (1 <= mo <= 12 and 1 <= d <= 31):
+                        continue
+                    new_pub = f"{y:04d}-{mo:02d}-{d:02d}T12:00:00+00:00"
+                    c.execute(
+                        "UPDATE items SET pub_date = ? WHERE id = ?",
+                        (new_pub, r["id"]),
+                    )
+                    fixed += 1
+                except Exception:
+                    continue
+        return fixed
 
     def get_sources_status(self):
         from feeds import FEEDS
