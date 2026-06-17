@@ -30,6 +30,14 @@ scheduler = make_scheduler(db)
 async def lifespan(app: FastAPI):
     log.info("starting up — %d feed entries, %d unique URLs",
              len(FEEDS), len({f["url"] for f in FEEDS}))
+    # One-shot migration: heal items whose pub_date was previously stamped
+    # with fetched_at because the source feed lacked a real publication date.
+    try:
+        fixed = db.repair_pub_dates_from_link()
+        if fixed:
+            log.info("repaired %d item pub_dates from URL path", fixed)
+    except Exception:
+        log.exception("pub_date repair migration failed")
     scheduler.start()
     threading.Thread(target=_initial_refresh, daemon=True).start()
     yield
